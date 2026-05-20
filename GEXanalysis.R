@@ -241,7 +241,7 @@ saveRDS(sample_name.markers, file = "sample_name.markers.rds")
 
 # --- SAVE AS EXCEL (to open in Excel) ---
 # All markers
-write_xlsx(sample_name.markers, "E22150_AllMarkers.xlsx")
+write_xlsx(sample_name.markers, "sample_name_AllMarkers.xlsx")
 
 # Top 10 per cluster only
 write_xlsx(top10_per_cluster, "sample_name_Top10_per_Cluster.xlsx")
