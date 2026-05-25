@@ -1,0 +1,196 @@
+#### Integration GEX/BCR ####
+
+
+# Will need: 
+# 1. input csv filtered_contig_annotations.csv
+# 2. rds file with the annotated object
+
+
+library(Seurat)
+library(scRepertoire)
+library(readxl)
+library(openxlsx)
+library(dplyr)
+
+# STEP 1: LOAD DATA & INITIALIZE VARIABLE NAMES -----------------------------------------------------------------------------------------------------
+
+sample_name  <- "sample_name"
+
+# Load your final annotated Seurat object
+so.annotated <- readRDS("sample_name_annotated.so.rds")
+print(class(so.annotated)) 
+
+# Load your raw 10x contig csv file
+vdj_file <- read.csv("filtered_contig_annotations.csv")
+
+
+# STEP 2: BARCODE ALIGNMENT & CELL RENAMING
+
+message("Original Seurat Barcode Example: ", head(Cells(so.annotated), 1))
+message("Raw VDJ File Barcode Example:    ", head(vdj_file$barcode, 1))
+
+# Rename your Seurat cells so the prefix matches downstream metadata syntax ("sample_name_AAAC...")
+so.annotated <- RenameCells(so.annotated, add.cell.id = sample_name)
+
+
+# STEP 3: HEAVY-CHAIN METADATA EXTRACTION & CLEANING ----------------------------------------------------------------------------------------------------------------
+
+combined.BCR <- combineBCR(
+  input.data = vdj_file,
+  samples = sample_name,
+  chain = "both",
+  sequence = "nt",
+  call.related.clones = FALSE,
+  group.by = NULL,
+  threshold = 0.85,
+  cluster.method = "components",
+  use.V = TRUE,
+  use.J = TRUE,
+  removeNA = FALSE,
+  removeMulti = FALSE,
+  filterMulti = TRUE,
+  filterNonproductive = TRUE
+)
+
+
+# Extract first/only sample table
+sample_name_combined <- combined.BCR[[1]]
+
+# Check BCR barcodes
+head(sample_name_combined$barcode)
+
+
+write.xlsx(
+  x = sample_name_combined, 
+  file = "combined.sample_name_BCR.clustered.xlsx", 
+  sheetName = "BCR_Clonotypes",
+  rowNames = FALSE
+)
+
+# STEP 4: INJECT SCREPERTOIRE COLUMNS  -------------------------------------------------------------------------------------------------------
+
+so.annotated <- combineExpression(
+  input.data = combined.BCR,
+  sc.data = so.annotated,
+  cloneCall = "strict",
+  chain = "both",
+  group.by = NULL,
+  proportion = TRUE,
+  filterNA = FALSE,
+  cloneSize = c(Rare = 1e-04, Small = 0.001, Medium = 0.01, Large = 0.1, Hyperexpanded = 1),
+  addLabel = FALSE
+)
+
+
+# STEP 5: ADD HEAVY-CHAIN METADATA (c_gene, V/J, CDR3) PER BARCODE -----------------------------------------------------------------------------------------
+
+igh_meta <- vdj_file %>%
+  dplyr::filter(chain == "IGH") %>%
+  dplyr::select(
+    barcode,
+    c_gene,
+    v_gene,
+    d_gene,
+    j_gene,
+    cdr3,
+    cdr3_nt,
+    productive,
+    raw_clonotype_id,
+    umis,
+    reads
+  )
+
+# Keep the strongest biological heavy chain signal per unique droplet cell barcode
+igh_meta_top <- igh_meta %>%
+  dplyr::group_by(barcode) %>%
+  dplyr::arrange(dplyr::desc(umis), dplyr::desc(reads), .by_group = TRUE) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+# Append the "sample_name_" prefix to match row names character-for-character
+igh_meta_top$barcode <- paste0(sample_name, "_", igh_meta_top$barcode)
+
+colnames(igh_meta_top) <- c(
+  "barcode",
+  "IGH_cgene",
+  "IGH_vgene",
+  "IGH_dgene",
+  "IGH_jgene",
+  "IGH_cdr3",
+  "IGH_cdr3_nt",
+  "IGH_productive",
+  "IGH_raw_clonotype_id",
+  "IGH_umis",
+  "IGH_reads"
+)
+
+igh_meta_df <- as.data.frame(igh_meta_top)
+rownames(igh_meta_df) <- igh_meta_df$barcode
+igh_meta_df$barcode <- NULL
+
+# Inject the high-resolution heavy-chain features directly into the combined object
+so.annotated <- AddMetaData(so.annotated, metadata = igh_meta_df)
+
+
+# STEP 6: ADD SIMPLIFIED CLINICAL ISOTYPE GROUP --------------------------------------------------------------------------------------------------------------------------
+
+so.annotated$isotype_group <- dplyr::case_when(
+  grepl("IGHM", so.annotated$IGH_cgene) ~ "IgM",
+  grepl("IGHD", so.annotated$IGH_cgene) ~ "IgD",
+  grepl("IGHG", so.annotated$IGH_cgene) ~ "IgG",
+  grepl("IGHA", so.annotated$IGH_cgene) ~ "IgA",
+  TRUE ~ NA_character_
+)
+
+# --- SANITY CHECK THE DATA FRAME ---
+# View the final 32-column metadata framework
+head(so.annotated@meta.data)
+
+
+saveRDS(so.annotated, "so.annotated.bcr.combined.rds")
+
+# STEP 7: CHECK -----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+table(so.annotated$IGH_cgene, useNA = "ifany")
+table(so.annotated$isotype_group, useNA = "ifany")
+sort(table(so.annotated$CTstrict), decreasing = TRUE)[1:10]
+
+
+# STEP 8: EXTRACT SPECIFIC ISOTYPE BARCODES (IgA & IgM) --------------------------------------------------------------------------------------------------------------------------------
+
+# Pull out the full metadata table into a data frame
+metadata_df <- so.annotated@meta.data
+
+# Add the cell barcodes as an explicit column instead of just row names
+metadata_df$cell_barcode <- rownames(metadata_df)
+
+# Filter strictly for IgA and IgM cells
+# We select key descriptive columns so it is easy to inspect
+iga_cells <- metadata_df %>%
+  dplyr::filter(isotype_group == "IgA") %>%
+  dplyr::select(cell_barcode, isotype_group, IGH_cgene, IGH_vgene, IGH_jgene, IGH_cdr3, seurat_clusters, cloneSize)
+
+igm_cells <- metadata_df %>%
+  dplyr::filter(isotype_group == "IgM") %>%
+  dplyr::select(cell_barcode, isotype_group, IGH_cgene, IGH_vgene, IGH_jgene, IGH_cdr3, seurat_clusters, cloneSize)
+
+
+# Print results to the console for immediate review
+message("\n--- IDENTIFIED IgA CELL BARCODES (Total: ", nrow(iga_cells), ") ---")
+print(head(iga_cells, 10)) # Shows the first 10 rows
+
+message("\n--- IDENTIFIED IgM CELL BARCODES (Total: ", nrow(igm_cells), ") ---")
+print(head(igm_cells, 10))
+
+
+# Export them into a dedicated Excel workbook with separate tabs
+wb_isotypes <- createWorkbook()
+
+addWorksheet(wb_isotypes, "IgM_Barcodes")
+writeData(wb_isotypes, "IgM_Barcodes", igm_cells)
+
+addWorksheet(wb_isotypes, "IgA_Barcodes")
+writeData(wb_isotypes, "IgA_Barcodes", iga_cells)
+
+saveWorkbook(wb_isotypes, "sample_name_IgM_and_IgA_Barcodes.xlsx", overwrite = TRUE)
+
